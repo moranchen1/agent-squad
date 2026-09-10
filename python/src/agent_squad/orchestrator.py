@@ -13,6 +13,7 @@ from agent_squad.agents import (Agent,
                                              AgentProcessingResult)
 from agent_squad.storage import ChatStorage
 from agent_squad.storage import InMemoryChatStorage
+from agent_squad.monitoring import AgentMetricsCollector
 try:
     from agent_squad.classifiers import BedrockClassifier, BedrockClassifierOptions
     _BEDROCK_AVAILABLE = True
@@ -26,7 +27,8 @@ class AgentSquad:
                  storage: ChatStorage | None = None,
                  classifier: Classifier  | None = None,
                  logger: Logger | None = None,
-                 default_agent: Agent | None = None):
+                 default_agent: Agent | None = None,
+                 enable_performance_monitoring: bool = True):
 
         DEFAULT_CONFIG=AgentSquadConfig()
 
@@ -58,6 +60,10 @@ class AgentSquad:
 
         self.execution_times: dict[str, float] = {}
         self.default_agent: Agent = default_agent
+        
+        # Initialize performance monitoring
+        self.enable_performance_monitoring = enable_performance_monitoring
+        self.metrics_collector = AgentMetricsCollector() if enable_performance_monitoring else None
 
 
     def add_agent(self, agent: Agent):
@@ -65,6 +71,10 @@ class AgentSquad:
             raise ValueError(f"An agent with ID '{agent.id}' already exists.")
         self.agents[agent.id] = agent
         self.classifier.set_agents(self.agents)
+        
+        # Initialize metrics for new agent
+        if self.metrics_collector:
+            self.metrics_collector.initialize_agent(agent.id, agent.name)
 
     def get_default_agent(self) -> Agent:
         return self.default_agent
@@ -77,6 +87,63 @@ class AgentSquad:
             "name": agent.name,
             "description": agent.description
         } for key, agent in self.agents.items()}
+    
+    def get_agent_metrics(self, agent_id: str | None = None):
+        """Get performance metrics for agent(s).
+        
+        Args:
+            agent_id: Specific agent ID to get metrics for. If None, returns all metrics.
+            
+        Returns:
+            Dictionary with agent metrics or None if monitoring is disabled.
+        """
+        if not self.metrics_collector:
+            return None
+        
+        if agent_id:
+            return self.metrics_collector.get_agent_metrics(agent_id)
+        return self.metrics_collector.get_all_metrics()
+    
+    def get_disabled_agents(self) -> dict[str, str]:
+        """Get all disabled agents and reasons.
+        
+        Returns:
+            Dictionary mapping agent IDs to disable reasons.
+        """
+        if not self.metrics_collector:
+            return {}
+        return self.metrics_collector.get_disabled_agents()
+    
+    def enable_agent(self, agent_id: str) -> bool:
+        """Re-enable a previously disabled agent.
+        
+        Args:
+            agent_id: Agent ID to enable.
+            
+        Returns:
+            True if agent was enabled, False otherwise.
+        """
+        if not self.metrics_collector:
+            return False
+        return self.metrics_collector.enable_agent(agent_id)
+    
+    def reset_agent_metrics(self, agent_id: str | None = None) -> bool:
+        """Reset metrics for an agent or all agents.
+        
+        Args:
+            agent_id: Specific agent ID to reset. If None, resets all.
+            
+        Returns:
+            True if successful, False otherwise.
+        """
+        if not self.metrics_collector:
+            return False
+        
+        if agent_id:
+            return self.metrics_collector.reset_agent_metrics(agent_id)
+        
+        self.metrics_collector.reset_all_metrics()
+        return True
 
     async def dispatch_to_agent(self, params: dict[str, Any]
                                 ) -> ConversationMessage | AsyncIterable[Any]:
@@ -135,23 +202,50 @@ class AgentSquad:
             raise error
 
     async def agent_process_request(self,
-                               user_input: str,
-                               user_id: str,
-                               session_id: str,
-                               classifier_result: ClassifierResult,
-                               additional_params: dict[str, str] | None = None,
-                               stream_response: bool | None = False # wether to stream back the response from the agent
+                                user_input: str,
+                                user_id: str,
+                                session_id: str,
+                                classifier_result: ClassifierResult,
+                                additional_params: dict[str, str] | None = None,
+                                stream_response: bool | None = False # wether to stream back the response from the agent
     ) -> AgentResponse:
         """Process agent response and handle chat storage."""
         try:
             if classifier_result.selected_agent:
-                agent_response = await self.dispatch_to_agent({
-                    "user_input": user_input,
-                    "user_id": user_id,
-                    "session_id": session_id,
-                    "classifier_result": classifier_result,
-                    "additional_params": additional_params
-                })
+                # Check if agent is disabled
+                if self.metrics_collector and self.metrics_collector.is_agent_disabled(classifier_result.selected_agent.id):
+                    agent_metrics = self.metrics_collector.get_agent_metrics(classifier_result.selected_agent.id)
+                    self.logger.warning(f"Agent {classifier_result.selected_agent.name} is disabled: {agent_metrics.disable_reason}")
+                    return AgentResponse(
+                        metadata=self.create_metadata(classifier_result, user_input, user_id, session_id, additional_params),
+                        output=ConversationMessage(
+                            role=ParticipantRole.ASSISTANT.value,
+                            content=[{'text': f"The agent '{classifier_result.selected_agent.name}' is currently unavailable due to performance issues. Please try again later."}]
+                        ),
+                        streaming=False
+                    )
+                
+                start_time = time.time()
+                try:
+                    agent_response = await self.dispatch_to_agent({
+                        "user_input": user_input,
+                        "user_id": user_id,
+                        "session_id": session_id,
+                        "classifier_result": classifier_result,
+                        "additional_params": additional_params
+                    })
+                    
+                    # Record success in metrics
+                    if self.metrics_collector:
+                        latency_ms = (time.time() - start_time) * 1000
+                        self.metrics_collector.record_success(classifier_result.selected_agent.id, latency_ms)
+                        
+                except Exception as e:
+                    # Record failure in metrics
+                    if self.metrics_collector:
+                        latency_ms = (time.time() - start_time) * 1000
+                        self.metrics_collector.record_failure(classifier_result.selected_agent.id, str(e), latency_ms)
+                    raise
 
                 metadata = self.create_metadata(classifier_result,
                                             user_input,
